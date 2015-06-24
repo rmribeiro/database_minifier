@@ -51,6 +51,11 @@ class DatabaseMinifier
     protected $copied = [];
 
     /**
+     * @var resource
+     */
+    protected $outHandler;
+
+    /**
      * DatabaseMinifier constructor.
      *
      * @param array $masterDbConfig in format array('dbname' => {DBNAME}, 'username' => {USERNAME}, 'password'=> {PASSWORD}, 'host' => {HOST}[, 'driver_options' => {options}])
@@ -229,6 +234,29 @@ class DatabaseMinifier
     public function setSlaveDbConfig($slaveDbConfig)
     {
         $this->slaveDbConfig = $slaveDbConfig;
+
+        return $this;
+    }
+
+    /**
+     * @return resource
+     */
+    public function getHandler()
+    {
+        if (!$this->outHandler) {
+            $this->outHandler = fopen('php://stdout', 'w');
+        }
+        return $this->outHandler;
+    }
+
+    /**
+     * @param resource $handler
+     *
+     * @return self
+     */
+    public function setHandler($handler)
+    {
+        $this->outHandler = $handler;
 
         return $this;
     }
@@ -542,36 +570,51 @@ class DatabaseMinifier
         $insertData        = [];
         $updateExpressions = [];
         $fields            = [];
+        $insertDataValues  = [];
+        $updateExpressionsValues = [];
+        $pdo = $this->getMasterPdo();
+
         foreach ($row as $field => $value) {
             $token = ":{$field}_token_insert";
             //$updateToken              = ":{$field}_token_update";
             $insertData[$token] = $value;
             //$updateData[$updateToken] = $value;
             $updateExpressions[] = "`$field` = $token";
+            $insertDataValues[] = $pdo->quote($value);
+            $updateExpressionsValues[] = "`$field` = " . $pdo->quote($value);
             $fields[]            = "`$field`";
         }
 
-        $sql = "INSERT INTO $tableName (" . implode(', ', $fields) . ")
+        if ($this->getSlavePdo()) {
+
+            $sql = "INSERT INTO $tableName (" . implode(', ', $fields) . ")
                 VALUES (" . implode(', ', array_keys($insertData)) . ")
                 ON DUPLICATE KEY UPDATE " . implode(',', $updateExpressions) . "; ";
 
-        $query = $this->getSlavePdo()->prepare($sql);
+            $query = $this->getSlavePdo()->prepare($sql);
 
-        try {
-            $result = $query->execute($insertData);
-        } catch (\Exception $e) {
-            $table    = $this->getTable($tableName);
-            $pks      = implode(', ', $table['primary_key']);
-            $pkValues = [];
-            foreach ($table['primary_key'] as $pk) {
-                $pkValues[] = $row[$pk];
+            try {
+                $result = $query->execute($insertData);
+            } catch (\Exception $e) {
+                $table = $this->getTable($tableName);
+                $pks = implode(', ', $table['primary_key']);
+                $pkValues = [];
+                foreach ($table['primary_key'] as $pk) {
+                    $pkValues[] = $row[$pk];
+                }
+
+                $pkValue = implode(', ', $pkValues);
+
+                throw new DatabaseMinifierException(
+                    "Unable to paste row with PK [$pks] = ($pkValue) in table $tableName " . $e->getMessage()
+                );
             }
+        } else {
+            $sql = "INSERT INTO $tableName (" . implode(', ', $fields) . ")
+                VALUES (" . implode(', ', $insertDataValues) . ")
+                ON DUPLICATE KEY UPDATE " . implode(',', $updateExpressionsValues) . "; ";
 
-            $pkValue = implode(', ', $pkValues);
-
-            throw new DatabaseMinifierException(
-                "Unable to paste row with PK [$pks] = ($pkValue) in table $tableName " . $e->getMessage()
-            );
+            $result = (bool) fwrite($this->getHandler(), $sql . PHP_EOL);
         }
 
         return $result;
